@@ -1,0 +1,46 @@
+name: QA Spark CodeAgent
+description: >
+  AI-powered code review and certification agent for Cloudera platform code.
+  Reviews Impala SQL, PySpark, and Python scripts for optimization, best practices,
+  and resource efficiency. Issues certification for code scoring 95+/100.
+  Integrates with GitLab CI to gate merge requests.
+author: robosecure
+specification_version: 1.0
+prototype_version: 1.0.0
+date_modified: "2026-03-05"
+
+environment_variables:
+  OPENAI_API_KEY:
+    default: ""
+    description: "API key for your OpenAI-compatible proxy"
+  OPENAI_API_BASE:
+    default: "https://api.openai.com/v1"
+    description: "Base URL for your OpenAI proxy endpoint"
+  MODEL_NAME:
+    default: "gpt-5.2"
+    description: "Model name as recognized by your proxy (e.g. gpt-5.2, gpt-4o)"
+  PASS_THRESHOLD:
+    default: "95"
+    description: "Minimum score (0-100) required for certification"
+
+runtimes:
+  - editor: JupyterLab
+    kernel: Python 3.9
+    edition: Standard
+    version: "2024.02"
+
+tasks:
+  - type: run_session
+    name: Install Dependencies
+    script: cdsw-build.sh
+    short_summary: Install Python requirements
+    cpu: 1
+    memory: 2
+
+  - type: start_application
+    name: QA Spark CodeAgent UI
+    subdomain: qa-spark
+    script: streamlit run app/streamlit_app.py --server.port $CDSW_APP_PORT --server.address 127.0.0.1
+    short_summary: Interactive code review web interface
+    cpu: 1
+    memory: 2

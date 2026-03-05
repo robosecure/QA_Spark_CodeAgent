@@ -1,0 +1,127 @@
+# ============================================================
+# QA Spark CodeAgent — GitLab CI Template
+# ============================================================
+# HOW TO USE:
+#   Copy this file into your project's .gitlab-ci.yml, OR
+#   include it remotely:
+#
+#   include:
+#     - project: 'robosecure/QA_Spark_CodeAgent'
+#       file: '/gitlab/qa-spark-ci-template.yml'
+#
+# REQUIRED CI/CD VARIABLES (set in GitLab → Settings → CI/CD → Variables):
+#   OPENAI_API_KEY    — your OpenAI proxy API key
+#   OPENAI_API_BASE   — your proxy base URL (e.g. https://proxy.company.com/v1)
+#   GITLAB_TOKEN      — token with api scope, for posting MR comments
+#
+# OPTIONAL:
+#   MODEL_NAME        — default: gpt-5.2
+#   PASS_THRESHOLD    — default: 95
+# ============================================================
+
+stages:
+  - qa-review
+
+qa-spark-code-review:
+  stage: qa-review
+  image: python:3.11-slim
+
+  variables:
+    QA_AGENT_REPO: "https://github.com/robosecure/QA_Spark_CodeAgent.git"
+    MODEL_NAME: "${MODEL_NAME:-gpt-5.2}"
+    PASS_THRESHOLD: "${PASS_THRESHOLD:-95}"
+
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git curl
+    - pip install --quiet openai python-dotenv
+    - git clone --depth 1 "$QA_AGENT_REPO" /tmp/qa-agent
+
+  script:
+    - |
+      set -e
+
+      # ── Detect changed files in this MR ─────────────────────────────────
+      if [ -n "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" ]; then
+        git fetch origin "$CI_MERGE_REQUEST_TARGET_BRANCH_NAME" --depth=50 2>/dev/null || true
+        CHANGED_FILES=$(git diff --name-only "origin/$CI_MERGE_REQUEST_TARGET_BRANCH_NAME"...HEAD 2>/dev/null || git diff --name-only HEAD~1)
+      else
+        CHANGED_FILES=$(git diff --name-only HEAD~1)
+      fi
+
+      echo "Changed files:"
+      echo "$CHANGED_FILES"
+
+      # ── Review each relevant file ────────────────────────────────────────
+      OVERALL_PASS=0
+      COMMENT_BODY="## ⚡ QA Spark CodeAgent — MR Review\n\n"
+
+      for FILE in $CHANGED_FILES; do
+        # Skip if file doesn't exist (deleted files)
+        [ -f "$FILE" ] || continue
+
+        # Determine language
+        if [[ "$FILE" == *.sql ]]; then
+          LANG="impala"
+        elif [[ "$FILE" == *.py ]]; then
+          if grep -qE "SparkContext|SparkSession|from pyspark|import pyspark" "$FILE" 2>/dev/null; then
+            LANG="pyspark"
+          else
+            LANG="python"
+          fi
+        else
+          continue  # Skip non-code files
+        fi
+
+        echo "------------------------------------------------------------"
+        echo "Reviewing: $FILE ($LANG)"
+        echo "------------------------------------------------------------"
+
+        # Run review — capture output and exit code
+        REVIEW_OUTPUT=$(
+          cd /tmp/qa-agent && \
+          OPENAI_API_KEY="$OPENAI_API_KEY" \
+          OPENAI_API_BASE="$OPENAI_API_BASE" \
+          MODEL_NAME="$MODEL_NAME" \
+          PASS_THRESHOLD="$PASS_THRESHOLD" \
+          python cli.py \
+            --file "$CI_PROJECT_DIR/$FILE" \
+            --language "$LANG" \
+            --gitlab-comment \
+            2>/dev/null
+        ) || OVERALL_PASS=1
+
+        COMMENT_BODY="${COMMENT_BODY}\n---\n${REVIEW_OUTPUT}\n"
+      done
+
+      # ── Post comment to MR ───────────────────────────────────────────────
+      if [ -n "$CI_MERGE_REQUEST_IID" ] && [ -n "$GITLAB_TOKEN" ]; then
+        echo "Posting review comment to MR !$CI_MERGE_REQUEST_IID ..."
+        ESCAPED_BODY=$(echo "$COMMENT_BODY" | python3 -c "import sys, json; print(json.dumps(sys.stdin.read()))")
+        curl -s -X POST \
+          -H "PRIVATE-TOKEN: $GITLAB_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d "{\"body\": $ESCAPED_BODY}" \
+          "$CI_API_V4_URL/projects/$CI_PROJECT_ID/merge_requests/$CI_MERGE_REQUEST_IID/notes" \
+          > /dev/null
+        echo "Comment posted."
+      else
+        echo "No MR context or GITLAB_TOKEN — skipping MR comment."
+        echo "$COMMENT_BODY"
+      fi
+
+      # ── Gate: fail the pipeline if any file did not pass ─────────────────
+      if [ "$OVERALL_PASS" -ne 0 ]; then
+        echo ""
+        echo "❌ One or more files did not reach the $PASS_THRESHOLD/100 certification threshold."
+        echo "   Fix the issues identified in the review and push again."
+        exit 1
+      fi
+
+      echo ""
+      echo "✅ All reviewed files are certified. MR is clear to merge."
+
+  # Only run on merge requests — not on pushes to main
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+
+  allow_failure: false
