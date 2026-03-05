@@ -10,6 +10,7 @@ class Config:
         self.api_base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1")
         self.model_name = os.environ.get("MODEL_NAME", "gpt-5.2")
         self.pass_threshold = int(os.environ.get("PASS_THRESHOLD", "95"))
+        self.spark_version = os.environ.get("SPARK_VERSION", "3.4")
 
         if not self.api_key:
             raise ValueError(

@@ -8,8 +8,13 @@ Used by:
 
 Usage:
   python cli.py --file path/to/code.sql --language impala
+  python cli.py --file path/to/query.sql --language sparksql
   python cli.py --file path/to/job.py --language pyspark --output json
+  python cli.py --file path/to/job.scala --language scala
   python cli.py --file path/to/script.py --language python --gitlab-comment
+
+Override Spark version (default 3.4):
+  SPARK_VERSION=3.5 python cli.py --file job.py --language pyspark
 """
 import argparse
 import json

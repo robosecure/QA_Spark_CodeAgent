@@ -13,6 +13,8 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 LANGUAGE_MAP = {
     "impala": "impala.json",
     "pyspark": "pyspark.json",
+    "sparksql": "sparksql.json",
+    "scala": "scala.json",
     "python": "python.json",
 }
 
@@ -45,6 +47,12 @@ def review_code(code: str, language: str) -> dict:
         base_url=cfg.api_base,
     )
 
+    spark_context = (
+        f"Apache Spark version: {cfg.spark_version} (default 3.4 unless overridden via SPARK_VERSION)."
+        if language in ("pyspark", "sparksql", "scala")
+        else ""
+    )
+
     system_prompt = f"""You are QA Spark CodeAgent — an expert code reviewer for the Cloudera CDP platform.
 
 Your job is to review code for:
@@ -52,6 +60,8 @@ Your job is to review code for:
 - Resource efficiency (CPU, memory, I/O, network)
 - Performance optimization (runtime speed, shuffle reduction, predicate pushdown, etc.)
 - Code readability and maintainability
+
+{spark_context}
 
 You follow this review contract exactly:
 {json.dumps(prompt_contract, indent=2)}

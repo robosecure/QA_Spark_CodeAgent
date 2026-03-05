@@ -26,17 +26,28 @@ with st.sidebar:
         "Language / Dialect",
         options=SUPPORTED_LANGUAGES,
         format_func=lambda x: {
+            "pyspark": "PySpark (Python) ★",
+            "sparksql": "SparkSQL ★",
+            "scala": "Scala (Spark) ★",
             "impala": "Impala SQL",
-            "pyspark": "PySpark (Python)",
             "python": "Python",
         }.get(x, x.upper()),
     )
+
+    spark_version = st.text_input(
+        "Spark Version (Spark languages)",
+        value="3.4",
+        help="Override Spark version for PySpark, SparkSQL, and Scala reviews. Default: 3.4",
+    )
+    import os
+    os.environ["SPARK_VERSION"] = spark_version
 
     st.markdown("---")
     st.markdown("### About")
     st.markdown(
         "QA Spark CodeAgent reviews code for the **Cloudera CDP platform** "
-        "and issues a certification when code scores **95+/100**."
+        "and issues a certification when code scores **95+/100**.\n\n"
+        "★ = Spark 3.4 optimized"
     )
     st.markdown(
         "**Checks:** best practices · resource efficiency · performance optimization · security"
@@ -70,7 +81,9 @@ with col_input:
     with paste_tab:
         lang_placeholder = {
             "impala": "-- Paste your Impala SQL here",
+            "sparksql": "-- Paste your SparkSQL query here (spark.sql / spark-sql shell)",
             "pyspark": "# Paste your PySpark code here",
+            "scala": "// Paste your Scala Spark code here",
             "python": "# Paste your Python code here",
         }.get(language, "# Paste your code here")
 

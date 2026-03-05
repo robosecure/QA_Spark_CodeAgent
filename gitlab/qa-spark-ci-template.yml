@@ -60,8 +60,11 @@ qa-spark-code-review:
         [ -f "$FILE" ] || continue
 
         # Determine language
+        # .sql files: SparkSQL by default; set QA_SQL_DIALECT=impala in CI vars to use Impala reviewer
         if [[ "$FILE" == *.sql ]]; then
-          LANG="impala"
+          LANG="${QA_SQL_DIALECT:-sparksql}"
+        elif [[ "$FILE" == *.scala ]]; then
+          LANG="scala"
         elif [[ "$FILE" == *.py ]]; then
           if grep -qE "SparkContext|SparkSession|from pyspark|import pyspark" "$FILE" 2>/dev/null; then
             LANG="pyspark"
@@ -83,6 +86,7 @@ qa-spark-code-review:
           OPENAI_API_BASE="$OPENAI_API_BASE" \
           MODEL_NAME="$MODEL_NAME" \
           PASS_THRESHOLD="$PASS_THRESHOLD" \
+          SPARK_VERSION="${SPARK_VERSION:-3.4}" \
           python cli.py \
             --file "$CI_PROJECT_DIR/$FILE" \
             --language "$LANG" \
