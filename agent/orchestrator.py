@@ -25,10 +25,12 @@ from typing import Optional
 from config import Config
 from cost.tracker import CostTracker
 from cost.roi_logger import log_review
-from agent.sanitizer import sanitize
-from agent.chunker import split_into_chunks
-from agent.token_budget import needs_chunking, TOKEN_LIMIT_FULL_REVIEW
+from agent.sanitizer import Sanitizer as _Sanitizer
+from agent.chunker import CodeChunker, CodeChunk
+from agent.token_budget import TokenBudget
 from agent.embedding_cache import get_cache
+
+_sanitizer = _Sanitizer()
 from agent.security_agent import SecurityAgent
 from agent.performance_agent import PerformanceAgent
 from agent.practices_agent import PracticesAgent
@@ -103,7 +105,7 @@ class Orchestrator:
         cache = get_cache()
 
         # ── 1. Sanitize ────────────────────────────────────────────────────────
-        safe_code, redactions = sanitize(code)
+        safe_code, redactions = _sanitizer.run(code)
         if redactions:
             logger.warning("Sanitizer masked %d secret(s) before LLM call", len(redactions))
 
@@ -117,11 +119,12 @@ class Orchestrator:
         context_hint = cache.similar_context(safe_code, lang)
 
         # ── 4. Chunking ────────────────────────────────────────────────────────
-        if needs_chunking(safe_code):
-            chunks = split_into_chunks(safe_code, lang)
+        budget = TokenBudget(self.config)
+        chunker = CodeChunker(max_tokens=self.config.max_tokens_per_chunk)
+        if budget.needs_chunking(safe_code):
+            chunks = chunker.split(safe_code, lang)
         else:
-            from agent.chunker import CodeChunk
-            chunks = [CodeChunk(content=safe_code, index=0, total=1)]
+            chunks = [CodeChunk(safe_code, 0, 1)]
 
         # ── 5. Run agents across all chunks ───────────────────────────────────
         sec_agent  = SecurityAgent(self.config, tracker)
@@ -144,7 +147,7 @@ class Orchestrator:
                 (perf_agent, "performance_agent"),
                 (prac_agent, "practices_agent"),
             ]:
-                res = agent.run(chunk.content, lang, spark_ver, chunk_hint)
+                res = agent.run(chunk.code, lang, spark_ver, chunk_hint)
                 agent_results[key]["chunks_raw"].append(res["raw"])
                 agent_results[key]["score"] = max(
                     agent_results[key]["score"], res["score"]
