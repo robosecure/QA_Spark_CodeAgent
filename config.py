@@ -38,6 +38,11 @@ class Config:
             else self.openai_model_name
         )
 
+        # ── Multi-agent / token settings ──────────────────────────────────────
+        self.agent_mode = os.environ.get("AGENT_MODE", "multi").lower()  # "single" | "multi"
+        self.max_tokens_per_chunk = int(os.environ.get("MAX_TOKENS_PER_CHUNK", "2500"))
+        self.max_tokens_per_review = int(os.environ.get("MAX_TOKENS_PER_REVIEW", "20000"))
+
         self._validate()
 
     def _validate(self):

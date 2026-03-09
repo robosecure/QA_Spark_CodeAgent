@@ -1,17 +1,29 @@
-import os
+"""
+QA Spark CodeAgent — Streamlit UI (Multi-Agent Edition)
+
+Tabs:
+  Input — three sub-tabs: GitLab repo, Paste code, Upload file
+  Results — composite score, per-agent breakdown, corrected code, full review text
+  Cost & ROI — per-review cost, lifetime ROI summary, cost-by-language chart
+"""
+import json
 import sys
-import re
-import datetime
 from pathlib import Path
 
-import requests
 import streamlit as st
 
-sys.path.insert(0, str(Path(__file__).parent.parent))
+# ── Path setup ────────────────────────────────────────────────────────────────
+ROOT = Path(__file__).parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from config import Config
+from agent.orchestrator import Orchestrator
 from agent.reviewer import review_code, SUPPORTED_LANGUAGES
 from agent.scorer import extract_score, get_certification
+from cost.roi_logger import roi_summary
 
-# ── Page config ────────────────────────────────────────────────────────────────
+# ── Page config ───────────────────────────────────────────────────────────────
 st.set_page_config(
     page_title="QA Spark CodeAgent",
     page_icon="⚡",
@@ -19,437 +31,404 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ── Custom CSS ─────────────────────────────────────────────────────────────────
-st.markdown("""
-<style>
-    .score-box {
-        border-radius: 12px;
-        padding: 20px 28px;
-        text-align: center;
-        font-size: 2.4rem;
-        font-weight: 800;
-        margin-bottom: 1rem;
-    }
-    .score-certified   { background: #d4edda; color: #155724; border: 2px solid #28a745; }
-    .score-warning     { background: #fff3cd; color: #856404; border: 2px solid #ffc107; }
-    .score-fail        { background: #f8d7da; color: #721c24; border: 2px solid #dc3545; }
-    .section-card {
-        background: #f8f9fa;
-        border-left: 4px solid #0d6efd;
-        border-radius: 6px;
-        padding: 14px 18px;
-        margin-bottom: 10px;
-    }
-    .hist-item {
-        font-size: 0.85rem;
-        padding: 6px 0;
-        border-bottom: 1px solid #eee;
-    }
-    .stTabs [data-baseweb="tab"] { font-size: 0.95rem; font-weight: 600; }
-</style>
-""", unsafe_allow_html=True)
-
-# ── Session state init ─────────────────────────────────────────────────────────
-if "history" not in st.session_state:
-    st.session_state.history = []
-if "last_result" not in st.session_state:
-    st.session_state.last_result = None
-
-# ── Language metadata ──────────────────────────────────────────────────────────
-LANG_LABELS = {
-    "pyspark":  "PySpark (Python) ★",
-    "sparksql": "SparkSQL ★",
-    "scala":    "Scala Spark ★",
+LANG_DISPLAY = {
     "impala":   "Impala SQL",
+    "pyspark":  "PySpark",
+    "sparksql": "SparkSQL",
+    "scala":    "Scala Spark",
     "python":   "Python",
 }
-LANG_EXTS = {".py": None, ".sql": None, ".scala": "scala"}
-LANG_PLACEHOLDERS = {
-    "pyspark":  "# Paste your PySpark code here",
-    "sparksql": "-- Paste your SparkSQL query here",
-    "scala":    "// Paste your Scala Spark code here",
-    "impala":   "-- Paste your Impala SQL here",
-    "python":   "# Paste your Python script here",
+
+SCORE_CSS = """
+<style>
+.score-box {
+    padding: 20px; border-radius: 12px; text-align: center;
+    font-size: 2.8rem; font-weight: bold; margin-bottom: 16px;
 }
-
-
-def detect_language(filename: str, content: str) -> str:
-    """Auto-detect language from filename + content."""
-    ext = Path(filename).suffix.lower()
-    if ext == ".scala":
-        return "scala"
-    if ext == ".sql":
-        if re.search(r"spark\.sql|SparkSession|spark-sql", content, re.I):
-            return "sparksql"
-        return "impala"
-    if ext == ".py":
-        if re.search(r"SparkSession|SparkContext|from pyspark|import pyspark", content):
-            return "pyspark"
-        return "python"
-    return "python"
-
-
-def score_color_class(score: int) -> str:
-    if score >= 95:
-        return "score-certified"
-    if score >= 75:
-        return "score-warning"
-    return "score-fail"
-
-
-def score_emoji(score: int) -> str:
-    if score >= 95:
-        return "✅"
-    if score >= 75:
-        return "⚠️"
-    return "❌"
-
-
-def fetch_gitlab_file(base_url: str, token: str, project: str, branch: str, filepath: str) -> str:
-    """Fetch raw file content from a GitLab instance."""
-    encoded_path = filepath.replace("/", "%2F")
-    encoded_project = project.replace("/", "%2F")
-    url = f"{base_url.rstrip('/')}/api/v4/projects/{encoded_project}/repository/files/{encoded_path}/raw?ref={branch}"
-    headers = {"PRIVATE-TOKEN": token}
-    resp = requests.get(url, headers=headers, timeout=15)
-    if resp.status_code == 404:
-        raise ValueError(f"File not found: {filepath} on branch {branch}")
-    if resp.status_code == 401:
-        raise ValueError("Invalid GitLab token — check your Personal Access Token.")
-    resp.raise_for_status()
-    return resp.text
-
-
-def run_review(code: str, language: str, source_label: str):
-    """Run the review and update session state."""
-    with st.spinner(f"Reviewing {LANG_LABELS.get(language, language)} code with {os.environ.get('AZURE_DEPLOYED_MODEL', 'AI model')}..."):
-        result = review_code(code, language)
-        score = extract_score(result["review"])
-        cert = get_certification(score)
-
-        st.session_state.last_result = {
-            "result": result,
-            "score": score,
-            "cert": cert,
-            "source": source_label,
-            "language": language,
-            "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-            "code": code,
-        }
-
-        # Add to history (keep last 10)
-        st.session_state.history.insert(0, {
-            "source": source_label,
-            "language": LANG_LABELS.get(language, language),
-            "score": score,
-            "certified": cert["certified"],
-            "timestamp": st.session_state.last_result["timestamp"],
-        })
-        if len(st.session_state.history) > 10:
-            st.session_state.history.pop()
+.score-certified   { background: #d4edda; color: #155724; border: 2px solid #28a745; }
+.score-not-certified { background: #f8d7da; color: #721c24; border: 2px solid #dc3545; }
+</style>
+"""
+st.markdown(SCORE_CSS, unsafe_allow_html=True)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR
+# Sidebar — history and settings
 # ══════════════════════════════════════════════════════════════════════════════
-with st.sidebar:
-    st.markdown("## ⚡ QA Spark CodeAgent")
-    st.caption("Cloudera CDP Code Review & Certification")
-    st.divider()
+def render_sidebar(cfg: Config):
+    with st.sidebar:
+        st.title("⚡ QA Spark CodeAgent")
+        st.caption(f"Model: **{cfg.model_name}** | Mode: **{cfg.agent_mode.upper()}**")
+        st.divider()
 
-    st.markdown("### Settings")
-    spark_version = st.text_input(
-        "Spark Version",
-        value=os.environ.get("SPARK_VERSION", "3.4"),
-        help="Applies to PySpark, SparkSQL, Scala reviews. Default: 3.4",
-    )
-    os.environ["SPARK_VERSION"] = spark_version
+        st.subheader("Review History")
+        history = st.session_state.get("history", [])
+        if not history:
+            st.caption("No reviews yet this session.")
+        for i, entry in enumerate(reversed(history[-10:])):
+            score = entry.get("score", "?")
+            lang  = entry.get("language", "?").upper()
+            cert  = "✅" if entry.get("certified") else "❌"
+            label = f"{cert} {lang} — {score}/100"
+            if st.button(label, key=f"hist_{i}", use_container_width=True):
+                st.session_state["show_result"] = entry
 
-    pass_threshold = st.slider(
-        "Certification Threshold",
-        min_value=80, max_value=100, value=95, step=1,
-        help="Minimum score required to earn certification"
-    )
-    os.environ["PASS_THRESHOLD"] = str(pass_threshold)
+        st.divider()
+        st.subheader("Settings")
+        mode = st.selectbox(
+            "Agent Mode",
+            ["multi", "single"],
+            index=0 if cfg.agent_mode == "multi" else 1,
+            key="agent_mode_select",
+        )
+        st.session_state["agent_mode_override"] = mode
 
-    st.divider()
-    st.markdown("### Review History")
-    if st.session_state.history:
-        for h in st.session_state.history:
-            badge = "✅" if h["certified"] else "❌"
-            st.markdown(
-                f'<div class="hist-item">{badge} <b>{h["score"]}/100</b> — '
-                f'{h["language"]}<br><small>{h["source"]} · {h["timestamp"]}</small></div>',
-                unsafe_allow_html=True,
-            )
-        if st.button("Clear History", use_container_width=True):
-            st.session_state.history = []
-            st.session_state.last_result = None
-            st.rerun()
-    else:
-        st.caption("No reviews yet.")
-
-    st.divider()
-    st.markdown(
-        "**★** = Spark 3.4 reviewed \n\n"
-        "**Checks:** best practices · performance · resource efficiency · security\n\n"
-        "Score **95+** = certified for Cloudera execution"
-    )
+        spark_ver = st.selectbox(
+            "Spark Version",
+            ["3.4", "3.5", "3.3"],
+            index=0,
+            key="spark_version_select",
+        )
+        st.session_state["spark_version_override"] = spark_ver
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# MAIN
+# Input tab
 # ══════════════════════════════════════════════════════════════════════════════
-st.title("⚡ QA Spark CodeAgent")
-st.markdown(
-    "Submit code for AI-powered review against Cloudera CDP best practices. "
-    "Code must score **95/100 or higher** to receive a certification badge."
-)
+def render_input_tab(cfg: Config):
+    st.header("Submit Code for Review")
 
-left, right = st.columns([1, 1], gap="large")
+    col1, col2 = st.columns([2, 1])
+    with col1:
+        language = st.selectbox(
+            "Language / Dialect",
+            SUPPORTED_LANGUAGES,
+            format_func=lambda x: LANG_DISPLAY.get(x, x),
+            key="language_select",
+        )
+    with col2:
+        st.metric("Pass Threshold", f"{cfg.pass_threshold}/100")
 
-# ── LEFT: Input ────────────────────────────────────────────────────────────────
-with left:
-    st.markdown("### Submit Code")
-
-    repo_tab, paste_tab, upload_tab = st.tabs([
-        "🔗 Code Repository",
-        "📋 Paste Code",
-        "📁 Upload File",
+    sub_tab_gitlab, sub_tab_paste, sub_tab_upload = st.tabs([
+        "🔗 GitLab Repo", "📋 Paste Code", "📁 Upload File"
     ])
 
-    code_to_review = ""
-    detected_language = None
-    source_label = ""
+    code = None
+    file_name = "<pasted>"
 
-    # ── Tab 1: Repository ──────────────────────────────────────────────────────
-    with repo_tab:
-        st.markdown("Connect to your GitLab repository to pull a file directly.")
+    # ── GitLab tab ─────────────────────────────────────────────────────────
+    with sub_tab_gitlab:
+        st.caption("Fetch a file directly from your GitLab repository.")
+        gl_url   = st.text_input("GitLab Project URL", placeholder="https://gitlab.company.com/group/project")
+        gl_token = st.text_input("GitLab Access Token", type="password")
+        gl_ref   = st.text_input("Branch / Tag / Commit", value="main")
+        gl_path  = st.text_input("File Path in Repo", placeholder="src/jobs/my_spark_job.py")
 
-        gitlab_url = st.text_input(
-            "GitLab Base URL",
-            value="https://gitlab.com",
-            placeholder="https://gitlab.yourcompany.com",
-        )
-        gitlab_token = st.text_input(
-            "Personal Access Token",
-            type="password",
-            placeholder="glpat-xxxxxxxxxxxxxxxxxxxx",
-            help="GitLab → User Settings → Access Tokens → create with `read_repository` scope",
-        )
-        repo_project = st.text_input(
-            "Project Path",
-            placeholder="group/project-name",
-        )
-        repo_branch = st.text_input("Branch", value="main")
-        repo_filepath = st.text_input(
-            "File Path in Repo",
-            placeholder="src/jobs/my_spark_job.py",
-        )
-
-        fetch_btn = st.button("⬇ Fetch File", use_container_width=True)
-
-        if fetch_btn:
-            if not all([gitlab_url, gitlab_token, repo_project, repo_branch, repo_filepath]):
-                st.error("Please fill in all fields above.")
+        if st.button("Fetch & Review", key="btn_gitlab", type="primary"):
+            if not (gl_url and gl_token and gl_path):
+                st.error("Please fill in all GitLab fields.")
             else:
-                with st.spinner("Fetching from GitLab..."):
-                    try:
-                        fetched = fetch_gitlab_file(
-                            gitlab_url, gitlab_token,
-                            repo_project, repo_branch, repo_filepath,
-                        )
-                        st.session_state["repo_code"] = fetched
-                        st.session_state["repo_file"] = repo_filepath
-                        st.success(f"Fetched: `{repo_filepath}` ({len(fetched.splitlines())} lines)")
-                    except Exception as e:
-                        st.error(str(e))
+                with st.spinner("Fetching file from GitLab…"):
+                    code, file_name = _fetch_gitlab_file(gl_url, gl_token, gl_ref, gl_path)
 
-        if "repo_code" in st.session_state:
-            code_to_review = st.session_state["repo_code"]
-            source_label = st.session_state.get("repo_file", "repo file")
-            detected_language = detect_language(source_label, code_to_review)
-            with st.expander("Preview fetched code"):
-                st.code(code_to_review[:2000] + ("..." if len(code_to_review) > 2000 else ""), language="python")
-
-    # ── Tab 2: Paste ───────────────────────────────────────────────────────────
-    with paste_tab:
-        paste_lang = st.selectbox(
-            "Language",
-            options=SUPPORTED_LANGUAGES,
-            format_func=lambda x: LANG_LABELS.get(x, x),
-            key="paste_lang",
-        )
+    # ── Paste tab ───────────────────────────────────────────────────────────
+    with sub_tab_paste:
         pasted = st.text_area(
             "Paste your code here",
-            height=380,
-            placeholder=LANG_PLACEHOLDERS.get(paste_lang, ""),
-            label_visibility="collapsed",
-            key="paste_code",
+            height=320,
+            placeholder="SELECT * FROM ...",
+            key="paste_area",
         )
-        if pasted.strip():
-            code_to_review = pasted
-            detected_language = paste_lang
-            source_label = "pasted code"
-            st.caption(f"{len(pasted.splitlines())} lines · {len(pasted):,} chars")
+        if st.button("Review Pasted Code", key="btn_paste", type="primary"):
+            if pasted.strip():
+                code = pasted
+            else:
+                st.error("Please paste some code first.")
 
-    # ── Tab 3: Upload ──────────────────────────────────────────────────────────
-    with upload_tab:
+    # ── Upload tab ──────────────────────────────────────────────────────────
+    with sub_tab_upload:
         uploaded = st.file_uploader(
             "Upload a code file",
-            type=["py", "sql", "scala"],
-            label_visibility="collapsed",
+            type=["sql", "py", "scala", "txt"],
+            key="file_uploader",
         )
-        if uploaded:
-            file_content = uploaded.read().decode("utf-8", errors="replace")
-            code_to_review = file_content
-            source_label = uploaded.name
-            detected_language = detect_language(uploaded.name, file_content)
-            st.success(f"Loaded: `{uploaded.name}` ({len(file_content.splitlines())} lines)")
-            st.caption(f"Auto-detected language: **{LANG_LABELS.get(detected_language, detected_language)}**")
-            with st.expander("Preview"):
-                st.code(file_content[:2000] + ("..." if len(file_content) > 2000 else ""), language="python")
+        if st.button("Review Uploaded File", key="btn_upload", type="primary"):
+            if uploaded:
+                code = uploaded.read().decode("utf-8", errors="replace")
+                file_name = uploaded.name
+                _auto_detect_language(uploaded.name)
+            else:
+                st.error("Please upload a file first.")
 
-    st.divider()
+    return code, language, file_name
 
-    # ── Language override + Run button ─────────────────────────────────────────
-    if code_to_review:
-        final_language = st.selectbox(
-            "Confirm / Override Language",
-            options=SUPPORTED_LANGUAGES,
-            index=SUPPORTED_LANGUAGES.index(detected_language) if detected_language in SUPPORTED_LANGUAGES else 0,
-            format_func=lambda x: LANG_LABELS.get(x, x),
-        )
 
-        run_btn = st.button(
-            "▶  Run Review",
-            type="primary",
-            use_container_width=True,
-        )
+def _fetch_gitlab_file(project_url: str, token: str, ref: str, file_path: str):
+    import requests
+    import urllib.parse
+    project_url = project_url.rstrip("/")
+    parts = project_url.split("/")
+    if len(parts) < 5:
+        st.error("Invalid GitLab URL format.")
+        return None, "<unknown>"
+    gitlab_base  = "/".join(parts[:3])
+    namespace    = parts[3]
+    project      = parts[4]
+    encoded_path = urllib.parse.quote_plus(f"{namespace}/{project}")
+    encoded_file = urllib.parse.quote_plus(file_path)
+    api_url = (
+        f"{gitlab_base}/api/v4/projects/{encoded_path}"
+        f"/repository/files/{encoded_file}/raw?ref={ref}"
+    )
+    resp = requests.get(api_url, headers={"PRIVATE-TOKEN": token}, timeout=15)
+    if resp.status_code == 200:
+        return resp.text, file_path.split("/")[-1]
+    st.error(f"GitLab API error {resp.status_code}: {resp.text[:200]}")
+    return None, "<unknown>"
 
-        if run_btn:
-            try:
-                run_review(code_to_review, final_language, source_label)
-            except Exception as e:
-                st.error(f"Review failed: {e}")
+
+def _auto_detect_language(filename: str):
+    ext = Path(filename).suffix.lower()
+    mapping = {".sql": "impala", ".py": "pyspark", ".scala": "scala"}
+    detected = mapping.get(ext)
+    if detected and detected in SUPPORTED_LANGUAGES:
+        st.session_state["language_select"] = detected
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Run review
+# ══════════════════════════════════════════════════════════════════════════════
+def run_review(code: str, language: str, file_name: str, cfg: Config) -> dict:
+    mode      = st.session_state.get("agent_mode_override", cfg.agent_mode)
+    spark_ver = st.session_state.get("spark_version_override", cfg.spark_version)
+
+    if mode == "multi":
+        orchestrator = Orchestrator(cfg, file_name=file_name)
+        result = orchestrator.review(code, language, spark_version=spark_ver)
+        result["mode"] = "multi"
     else:
-        st.info("Use one of the tabs above to load your code, then click **Run Review**.")
+        raw_result = review_code(code, language)
+        score      = extract_score(raw_result["review"])
+        cert       = get_certification(score, cfg.pass_threshold)
+        result = {
+            "mode":            "single",
+            "composite_score": score,
+            "certified":       cert["certified"],
+            "language":        language,
+            "agents":          {},
+            "key_findings":    [],
+            "corrected_code":  "",
+            "cost":            {"totals": {"cost_usd": 0, "total_tokens": 0}},
+            "raw_review":      raw_result["review"],
+            "chunks":          1,
+            "cache_hit":       False,
+            "cache_exact":     False,
+        }
+
+    result["language"]  = language
+    result["file_name"] = file_name
+    result["score"]     = result["composite_score"]
+
+    if "history" not in st.session_state:
+        st.session_state["history"] = []
+    st.session_state["history"].append(result)
+    st.session_state["show_result"] = result
+    return result
 
 
-# ── RIGHT: Results ─────────────────────────────────────────────────────────────
-with right:
-    st.markdown("### Review Result")
+# ══════════════════════════════════════════════════════════════════════════════
+# Results tab
+# ══════════════════════════════════════════════════════════════════════════════
+def render_results_tab(result: dict, cfg: Config):
+    if not result:
+        st.info("Submit code using the **Input** tab to see results here.")
+        return
 
-    data = st.session_state.last_result
+    score     = result.get("composite_score", 0)
+    certified = result.get("certified", False)
+    language  = result.get("language", "")
+    mode      = result.get("mode", "multi")
 
-    if not data:
-        st.markdown("""
-        **How it works:**
-        1. Load your code using one of the three input methods
-        2. Confirm the language and click **Run Review**
-        3. The AI reviews your code against Cloudera CDP best practices
-        4. You get a score, detailed findings, and fixed code
-        5. Score **95+** = certified to run on Cloudera
+    # ── Score banner ────────────────────────────────────────────────────────
+    css_class = "score-certified" if certified else "score-not-certified"
+    badge     = "✅ CERTIFIED" if certified else "❌ NOT CERTIFIED"
+    st.markdown(
+        f'<div class="score-box {css_class}">'
+        f'{badge}<br><span style="font-size:1.2rem">{score}/100</span>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
-        **Supported languages:**
-        - ⭐ PySpark · SparkSQL · Scala Spark (Spark 3.4)
-        - Impala SQL · Python
-        """)
-    else:
-        score = data["score"]
-        cert = data["cert"]
-        result = data["result"]
-        color_class = score_color_class(score)
-        emoji = score_emoji(score)
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Score",    f"{score}/100")
+    col2.metric("Required", f"{cfg.pass_threshold}/100")
+    col3.metric("Language", LANG_DISPLAY.get(language, language))
+    col4.metric("Chunks",   result.get("chunks", 1))
 
-        # ── Score banner ───────────────────────────────────────────────────────
-        st.markdown(
-            f'<div class="score-box {color_class}">'
-            f'{emoji} {score}/100 — {cert["status"]}'
-            f'</div>',
-            unsafe_allow_html=True,
+    if result.get("cache_exact"):
+        st.success("⚡ Exact cache hit — result from previous review of identical code.")
+    elif result.get("cache_hit"):
+        st.info("⚡ Cache hit — no LLM calls made for this review.")
+
+    # ── Agent breakdown (multi mode) ────────────────────────────────────────
+    agents  = result.get("agents", {})
+    weights = result.get("weights", {})
+    if mode == "multi" and agents:
+        st.subheader("Agent Score Breakdown")
+        cols = st.columns(len(agents))
+        for col, (agent_key, agent_data) in zip(cols, agents.items()):
+            label  = agent_key.replace("_agent", "").title()
+            ascore = agent_data.get("score", 0)
+            w      = weights.get(agent_key.replace("_agent", ""), 0)
+            col.metric(f"{label} ({int(w*100)}%)", f"{ascore}/100")
+
+        with st.expander("View Detailed Agent Reviews", expanded=False):
+            for agent_key, agent_data in agents.items():
+                label = agent_key.replace("_agent", "").title()
+                st.markdown(f"### {label} Agent")
+                st.markdown(agent_data.get("raw", "_No output_"))
+                st.divider()
+
+    # ── Single-agent review text ────────────────────────────────────────────
+    if mode == "single" and "raw_review" in result:
+        with st.expander("Full Review", expanded=True):
+            st.markdown(result["raw_review"])
+
+    # ── Key Findings ────────────────────────────────────────────────────────
+    findings = result.get("key_findings", [])
+    if findings:
+        st.subheader("Key Findings")
+        for finding in findings[:8]:
+            st.markdown(f"- {finding}")
+
+    # ── Corrected Code ──────────────────────────────────────────────────────
+    corrected = result.get("corrected_code", "")
+    if corrected:
+        st.subheader("Corrected / Improved Code")
+        st.code(corrected, language=_st_language(language))
+        st.download_button(
+            "⬇️ Download Corrected Code",
+            corrected,
+            file_name=f"corrected_{result.get('file_name', 'code')}",
+            mime="text/plain",
         )
 
-        # ── Score bar ──────────────────────────────────────────────────────────
-        st.progress(score / 100)
+    # ── Download full report ────────────────────────────────────────────────
+    report_json = json.dumps(result, indent=2, default=str)
+    st.download_button(
+        "⬇️ Download Full Report (JSON)",
+        report_json,
+        file_name="qa_spark_report.json",
+        mime="application/json",
+    )
 
-        # ── Meta row ───────────────────────────────────────────────────────────
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Score", f"{score}/100")
-        m2.metric("Threshold", f"{cert['threshold']}/100")
-        m3.metric("Language", LANG_LABELS.get(data["language"], data["language"]))
-        st.caption(
-            f"Source: `{data['source']}` · "
-            f"Model: {result['model']} · "
-            f"Provider: {result['provider'].upper()} · "
-            f"Reviewed at {data['timestamp']}"
-        )
+
+def _st_language(lang: str) -> str:
+    return {"pyspark": "python", "sparksql": "sql", "impala": "sql",
+            "scala": "scala", "python": "python"}.get(lang, "text")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Cost & ROI tab
+# ══════════════════════════════════════════════════════════════════════════════
+def render_roi_tab(result: dict):
+    st.header("Cost & ROI Dashboard")
+
+    # ── Current review cost ─────────────────────────────────────────────────
+    if result:
+        st.subheader("Current Review Cost")
+        cost        = result.get("cost", {})
+        totals      = cost.get("totals", {})
+        agents_cost = cost.get("agents", {})
+
+        col1, col2, col3 = st.columns(3)
+        col1.metric("Total Cost (USD)",  f"${totals.get('cost_usd', 0):.4f}")
+        col2.metric("Total Tokens",      f"{totals.get('total_tokens', 0):,}")
+        col3.metric("Provider / Model",  f"{cost.get('provider','?')} / {cost.get('model','?')}")
+
+        if agents_cost:
+            st.markdown("**Per-Agent Breakdown**")
+            rows = []
+            for name, data in agents_cost.items():
+                rows.append({
+                    "Agent":             name.replace("_agent", "").title(),
+                    "Prompt Tokens":     data.get("prompt_tokens", 0),
+                    "Completion Tokens": data.get("completion_tokens", 0),
+                    "Total Tokens":      data.get("total_tokens", 0),
+                    "Cost (USD)":        f"${data.get('cost_usd', 0):.4f}",
+                })
+            st.table(rows)
 
         st.divider()
 
-        # ── Sectioned output ───────────────────────────────────────────────────
-        review_text = result["review"]
+    # ── Lifetime ROI summary ────────────────────────────────────────────────
+    st.subheader("Lifetime ROI Summary")
+    summary = roi_summary()
 
-        # Split into named sections
-        section_pattern = re.compile(r"#{1,3}\s*\d+\.\s+(.+)", re.MULTILINE)
-        section_splits = list(section_pattern.finditer(review_text))
+    if summary.get("total_reviews", 0) == 0:
+        st.info("No historical reviews found. Start reviewing code to build ROI data.")
+        return
 
-        if section_splits:
-            sections = {}
-            for i, match in enumerate(section_splits):
-                start = match.start()
-                end = section_splits[i + 1].start() if i + 1 < len(section_splits) else len(review_text)
-                sections[match.group(0).strip()] = review_text[start:end].strip()
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("Total Reviews",     summary["total_reviews"])
+    col2.metric("Pass Rate",         f"{summary.get('pass_rate_pct', 0)}%")
+    col3.metric("Avg Score",         f"{summary.get('avg_score', 0)}/100")
+    col4.metric("Total Cost (USD)",  f"${summary.get('total_cost_usd', 0):.4f}")
 
-            tab_labels = list(sections.keys())
-            tabs = st.tabs([re.sub(r"#{1,3}\s*\d+\.\s*", "", t) for t in tab_labels])
-            for tab, (label, content) in zip(tabs, sections.items()):
-                with tab:
-                    st.markdown(content)
-        else:
-            # Fallback: render as one block
-            st.markdown(review_text)
+    col5, col6, col7 = st.columns(3)
+    col5.metric("Avg Cost / Review", f"${summary.get('avg_cost_usd', 0):.4f}")
+    col6.metric("Certified Reviews", summary.get("certified", 0))
+    col7.metric("Cache Hits",        summary.get("cache_hits", 0))
 
-        st.divider()
+    by_lang = summary.get("by_language", {})
+    if by_lang:
+        st.subheader("Reviews by Language")
+        lang_rows = []
+        for lang, data in by_lang.items():
+            lang_rows.append({
+                "Language":   LANG_DISPLAY.get(lang, lang),
+                "Reviews":    data["reviews"],
+                "Avg Score":  f"{data['avg_score']}/100",
+                "Cost (USD)": f"${data['cost_usd']:.4f}",
+            })
+        st.table(lang_rows)
 
-        # ── Download + copy actions ────────────────────────────────────────────
-        dl1, dl2 = st.columns(2)
-        with dl1:
-            report_md = (
-                f"# QA Spark CodeAgent Review\n\n"
-                f"**Source:** {data['source']}  \n"
-                f"**Language:** {LANG_LABELS.get(data['language'], data['language'])}  \n"
-                f"**Score:** {score}/100  \n"
-                f"**Status:** {cert['status']}  \n"
-                f"**Model:** {result['model']}  \n"
-                f"**Reviewed:** {data['timestamp']}\n\n"
-                f"---\n\n{review_text}"
-            )
-            st.download_button(
-                "⬇ Download Report (.md)",
-                data=report_md,
-                file_name=f"qa_review_{data['language']}_{score}.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-        with dl2:
-            # Extract optimized code block
-            code_match = re.search(r"```(?:\w+)?\n([\s\S]+?)```", review_text)
-            if code_match:
-                st.download_button(
-                    "⬇ Download Optimized Code",
-                    data=code_match.group(1),
-                    file_name=f"optimized_{data['language']}.{'sql' if data['language'] in ('impala','sparksql') else 'scala' if data['language'] == 'scala' else 'py'}",
-                    mime="text/plain",
-                    use_container_width=True,
-                )
 
-        # ── Token usage ────────────────────────────────────────────────────────
-        if result["usage"]["total_tokens"]:
-            with st.expander("Token Usage"):
-                u = result["usage"]
-                st.markdown(
-                    f"- **Prompt:** {u['prompt_tokens']:,} tokens\n"
-                    f"- **Completion:** {u['completion_tokens']:,} tokens\n"
-                    f"- **Total:** {u['total_tokens']:,} tokens"
-                )
+# ══════════════════════════════════════════════════════════════════════════════
+# Main
+# ══════════════════════════════════════════════════════════════════════════════
+def main():
+    try:
+        cfg = Config()
+    except Exception as e:
+        st.error(f"Configuration error: {e}")
+        st.stop()
+
+    render_sidebar(cfg)
+
+    tab_input, tab_results, tab_roi = st.tabs([
+        "📝 Input", "📊 Results", "💰 Cost & ROI"
+    ])
+
+    current_result = st.session_state.get("show_result")
+
+    with tab_input:
+        code, language, file_name = render_input_tab(cfg)
+        if code:
+            with st.spinner("Running review…"):
+                try:
+                    current_result = run_review(code, language, file_name, cfg)
+                    st.success("Review complete! See the **Results** tab.")
+                except Exception as e:
+                    st.error(f"Review failed: {e}")
+                    st.exception(e)
+
+    with tab_results:
+        render_results_tab(current_result, cfg)
+
+    with tab_roi:
+        render_roi_tab(current_result)
+
+
+if __name__ == "__main__":
+    main()
