@@ -33,6 +33,7 @@ from agent.security_agent import SecurityAgent
 from agent.performance_agent import PerformanceAgent
 from agent.practices_agent import PracticesAgent
 from mcp_server.cloudera_mcp import get_mcp_server
+from audit.audit_logger import log_review_session
 
 _sanitizer = _Sanitizer()
 
@@ -215,7 +216,7 @@ class Orchestrator:
         # ── 8. Cache store ─────────────────────────────────────────────────────
         cache.store(safe_code, lang, composite, all_findings[:6])
 
-        # ── 9. ROI log ─────────────────────────────────────────────────────────
+        # ── 9. ROI log + Audit log ─────────────────────────────────────────────
         cost_summary = tracker.summary()
         log_review(
             language=lang,
@@ -227,6 +228,27 @@ class Orchestrator:
             chunks_processed=len(chunks),
             cache_hit=False,
             reviewer_id=None,
+        )
+        log_review_session(
+            original_code=code,
+            sanitized_code=safe_code,
+            corrected_code=corrected_code,
+            language=lang,
+            file_name=self.file_name,
+            spark_version=spark_ver,
+            composite_score=composite,
+            certified=certified,
+            agent_scores={k: v["score"] for k, v in agent_results.items()},
+            weights=weights,
+            agent_raw_outputs={k: v["raw"] for k, v in agent_results.items()},
+            user_context=user_context,
+            project_context=project_context,
+            mcp_context_used=bool(mcp_context),
+            cache_hit=False,
+            cache_exact=False,
+            cost_summary=cost_summary,
+            chunks_processed=len(chunks),
+            review_mode="multi",
         )
 
         return {
