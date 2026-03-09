@@ -29,11 +29,12 @@ from agent.sanitizer import Sanitizer as _Sanitizer
 from agent.chunker import CodeChunker, CodeChunk
 from agent.token_budget import TokenBudget
 from agent.embedding_cache import get_cache
-
-_sanitizer = _Sanitizer()
 from agent.security_agent import SecurityAgent
 from agent.performance_agent import PerformanceAgent
 from agent.practices_agent import PracticesAgent
+from mcp_server.cloudera_mcp import get_mcp_server
+
+_sanitizer = _Sanitizer()
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,9 @@ class Orchestrator:
         code: str,
         language: str,
         spark_version: Optional[str] = None,
+        project_context: str = "",
+        user_context: str = "",
+        extra_tables: Optional[list] = None,
     ) -> dict:
         """
         Full multi-agent review pipeline.
@@ -116,7 +120,26 @@ class Orchestrator:
             return self._from_cache(cached, tracker, lang, cached_exact=True)
 
         # ── 3. Similar context hint ────────────────────────────────────────────
-        context_hint = cache.similar_context(safe_code, lang)
+        cache_hint = cache.similar_context(safe_code, lang)
+
+        # ── 3b. MCP metadata context ───────────────────────────────────────────
+        mcp = get_mcp_server()
+        mcp_context = mcp.get_context(safe_code, lang, extra_tables=extra_tables or [])
+
+        # ── 3c. Assemble full context header injected into every agent ─────────
+        context_parts = []
+        if user_context.strip():
+            context_parts.append(
+                "## Business Context (provided by developer)\n"
+                f"{user_context.strip()}\n"
+            )
+        if project_context.strip():
+            context_parts.append(project_context.strip())
+        if mcp_context.strip():
+            context_parts.append(mcp_context.strip())
+        if cache_hint.strip():
+            context_parts.append(cache_hint.strip())
+        context_hint = "\n\n".join(context_parts) + ("\n\n" if context_parts else "")
 
         # ── 4. Chunking ────────────────────────────────────────────────────────
         budget = TokenBudget(self.config)
@@ -221,6 +244,9 @@ class Orchestrator:
             "chunks": len(chunks),
             "cache_hit": False,
             "cache_exact": False,
+            "mcp_used": bool(mcp_context),
+            "project_context_used": bool(project_context),
+            "user_context": user_context,
         }
 
     def _from_cache(self, cached: dict, tracker: CostTracker, lang: str, cached_exact: bool) -> dict:
